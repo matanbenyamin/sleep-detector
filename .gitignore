@@ -1,0 +1,15 @@
+# secrets / credentials
+adbkey
+adbkey.pub
+*.pem
+client_secret*.json
+token.json
+lgtv_key.json
+
+# personal data
+hr_logs/
+sleep_profile.json
+
+# env
+.venv/
+__pycache__/

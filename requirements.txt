@@ -1,0 +1,8 @@
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+matplotlib>=3.7.0
+numpy>=1.23.0
+bleak>=0.21.0
+pywebostv>=0.8.9
+adb-shell>=0.4.4
