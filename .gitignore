@@ -13,3 +13,5 @@ sleep_profile.json
 # env
 .venv/
 __pycache__/
+dist/*.apk
+android/local.properties

@@ -65,18 +65,20 @@ class Config:
     window_now_s: int = 120          # window for "current" HR
     window_range_s: int = 300        # window for plateau stability
     history_s: int = 45 * 60         # kept samples
-    baseline_lag_s: int = 8 * 60     # baseline sees HR delayed by this much
-    baseline_tau_down_s: int = 10 * 60
-    baseline_tau_up_s: int = 20 * 60
+    floor_window_s: int = 40 * 60    # awake epochs used to learn the resting "floor"
+    floor_percentile: float = 20.0   # floor = this percentile of awake 1-min medians
+    floor_min_epochs: int = 8        # warm-up (awake minutes) when we already know your resting HR
+    floor_min_epochs_cold: int = 20  # ...and when we don't (first run)
     eval_every_s: float = 5.0
-    min_data_s: int = 150            # no decisions before this much data
+    min_data_s: int = 150
+    activity_hold_s: int = 300       # phone used within this long => awake
     score_smooth_tau_s: float = 45.0
     drowsy_on: float = 0.42
-    asleep_on: float = 0.62
+    asleep_on: float = 0.65
     asleep_off: float = 0.38
     drowsy_dwell_s: int = 60
-    asleep_dwell_s: int = 150        # score must stay >= asleep_on this long
-    wake_dwell_s: int = 75
+    asleep_dwell_s: int = 240        # score must stay >= asleep_on this long
+    wake_dwell_s: int = 120
     default_drop_frac: float = 0.09  # prior for "full" sleep drop, learned over time
 
 
@@ -96,8 +98,14 @@ class SleepDetector:
         self._below_since: Optional[float] = None    # wake dwell
         self.asleep_since: Optional[dt.datetime] = None
         self.recent_steps = -1                       # -1 = unknown
+        self.last_activity: Optional[float] = None   # epoch s of last phone use / known movement
+        self._epochs: Deque[Tuple[float, float]] = deque()   # (ts, 1-min median HR) while awake
+        self._next_epoch: Optional[float] = None
         self.profile = self._load_profile()
         self.drop_ref = self.profile.get("typical_drop_frac", self.cfg.default_drop_frac)
+        # Persistent personal awake-resting level (learned across sessions; can be seeded).
+        self.rest_prior: Optional[float] = self.profile.get("rest_floor")
+        self._last_prior_save = 0.0
         self._learned_this_sleep = False
 
     # ---------------------------------------------------------------- profile
@@ -109,6 +117,20 @@ class SleepDetector:
             except Exception:
                 pass
         return {}
+
+    def _update_prior(self, now: float):
+        """Slowly track the user's awake resting level (down faster than up)."""
+        if len(self._epochs) < self.cfg.floor_min_epochs_cold or self.baseline is None:
+            return
+        if self.rest_prior is None:
+            self.rest_prior = self.baseline
+        else:
+            a = 0.03 if self.baseline < self.rest_prior else 0.02
+            self.rest_prior += a * (self.baseline - self.rest_prior)
+        if now - self._last_prior_save > 600:
+            self._last_prior_save = now
+            self.profile["rest_floor"] = round(self.rest_prior, 2)
+            self._save_profile()
 
     def _save_profile(self):
         if not self.profile_path:
@@ -160,23 +182,33 @@ class SleepDetector:
 
         hr = float(np.median(cur))
 
-        # ---- baseline (lagged, asymmetric EMA, frozen while drowsy/asleep)
+        # ---- awake "floor": low percentile of 1-min medians recorded while AWAKE.
+        # A genuine sleep drop must go BELOW the lowest awake resting level, so merely
+        # calming down (or an elevated HR at app start) never looks like sleep.
+        if self._next_epoch is None:
+            self._next_epoch = self.samples[0][0] + 60
+        if now >= self._next_epoch:
+            self._next_epoch = now + 60
+            clearly_awake = self.state == AWAKE and self.score < 0.3 and (
+                self.rest_prior is None or hr >= 0.94 * self.rest_prior)
+            if clearly_awake:       # never learn the "floor" from drowsy/sleeping minutes
+                self._epochs.append((now, hr))
+            while self._epochs and self._epochs[0][0] < now - cfg.floor_window_s:
+                self._epochs.popleft()
+            if self.state == AWAKE and len(self._epochs) >= 1:
+                self.baseline = float(np.percentile([e[1] for e in self._epochs], cfg.floor_percentile))
+                self._update_prior(now)
+        need = cfg.floor_min_epochs if self.rest_prior else cfg.floor_min_epochs_cold
+        calibrating = len(self._epochs) < need and self.state == AWAKE and not self.asleep_since
         if self.baseline is None:
-            first = self._window(self.samples[0][0] + cfg.window_range_s, cfg.window_range_s)
-            self.baseline = float(np.median(first if len(first) else cur))
-        lagged = self._window(now, 90, lag=cfg.baseline_lag_s)
-        if self.state == AWAKE and len(lagged) >= 8:
-            target = float(np.median(lagged))
-            target = min(target, self.baseline * 1.12)       # ignore exercise/excitement spikes
-            tau = cfg.baseline_tau_down_s if target < self.baseline else cfg.baseline_tau_up_s
-            a = 1 - np.exp(-cfg.eval_every_s / tau)
-            self.baseline += a * (target - self.baseline)
-        base = self.baseline
+            self.baseline = hr
+        # Never let an elevated start inflate the reference: use the lower of session and personal level.
+        base = min(self.baseline, self.rest_prior) if self.rest_prior else self.baseline
 
         # ---- 1. drop: relative to baseline, normalised by the personal expected drop
-        drop_bpm = base - hr
+        margin = max(1.5, 0.03 * base)                 # ordinary awake wobble below the floor
         full_drop = max(3.5, self.drop_ref * base)
-        drop = _clamp01(drop_bpm / full_drop)
+        drop = _clamp01((base - margin - hr) / full_drop)
 
         # ---- 2. stability: robust range over 5 min
         if len(rng) >= 20:
@@ -200,27 +232,32 @@ class SleepDetector:
             x = (np.array([p[0] for p in tw]) - now) / 60.0
             y = np.array([p[1] for p in tw])
             slope = float(np.polyfit(x, y, 1)[0])
-            trend = _clamp01(-slope / 0.6)
+            trend = _clamp01(-slope / 0.6)   # weak evidence: calming down also falls
 
         # ---- penalties: spikes (movement/arousal) and steps
         penalty = 0.0
         reason = ""
         recent = self._window(now, 120)
         if len(recent):
-            if recent.max() - hr > max(10.0, 0.14 * base):
+            if self.state == AWAKE and recent.max() - hr > max(10.0, 0.14 * base):
                 penalty += 0.35
                 reason = "HR spike (movement?)"
-        if hr > base + 3:
+        if hr > base + 2:
             penalty += 0.3
-            reason = reason or "HR above baseline"
+            reason = reason or "HR above resting level"
+        if self.last_activity is not None and now - self.last_activity < cfg.activity_hold_s:
+            penalty += 0.7
+            reason = "phone in use"
         if self.recent_steps > 0:
             penalty += 0.6
             reason = f"{self.recent_steps} steps"
 
-        raw = (0.50 * drop + 0.20 * stability + 0.15 * smoothness + 0.15 * trend)
+        raw = (0.60 * drop + 0.20 * stability + 0.15 * smoothness + 0.05 * trend)
         # A plateau with no drop is just resting, never sleep: cap by drop.
         raw = min(raw, 0.25 + 0.9 * drop)
         raw = _clamp01(raw - penalty)
+        if calibrating:
+            raw, reason = 0.0, f"calibrating ({len(self._epochs)}/{need} min)"
 
         dtime = now - (self.snapshots[-1].t.timestamp() if self.snapshots else now - cfg.eval_every_s)
         a = 1 - np.exp(-max(dtime, 0.1) / cfg.score_smooth_tau_s)
